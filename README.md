@@ -30,12 +30,12 @@ month = apr,
 
 ## RedN quickstart
  * Build the project:
-    Go to the root directory and run `make`.
+    * Go to the root directory and run `make`.
 * Modify the NIC's firmware (warning: use this at your own discretion)
-    `cd conf` and run `./disable_wqe_checks.sh <device_name>`
+    * `cd conf` and run `./disable_wqe_checks.sh <device_name>`
     * By default the `device_name` is set to `mlx5_1`
 *  Build and run benchmarks:
-    `cd bench/micro` and then run `make`. To execute a hash table lookup offload:
+    * `cd bench/micro` and then run `make`. To execute a hash table lookup offload:
     * On the server run `./hash_bench`
     * On the client run `./hash_bench <peer_address> <iters>`
 
