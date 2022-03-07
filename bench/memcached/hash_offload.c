@@ -6,18 +6,14 @@
 #include <sys/types.h>
 #include <netinet/in.h>
 #include <inttypes.h>
-#include "time_stat.h"
 #include "agent.h"
-#include "hash_bench.h"
+#include "hash_offload.h"
 
-#define BLOCK_SIZE 4096
-#define BLOCK_SIZE_SHIFT 12
+#define BUFFER_SIZE 268265456UL //256 MB
 
-#define CHAIN_LENGTH 4
+#define IO_SIZE 1024
 
-#define OFFLOAD_COUNT 5
-
-#define MAX_LOCK_COUNT 100
+#define OFFLOAD_COUNT 1
 
 #define MAX(x, y) (((x) > (y)) ? (x) : (y))
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
@@ -60,43 +56,6 @@ enum sock_type {
 
 // #define OUTPUT_TO_FILE 1     // write output to file not stdout.
 
-void* create_shm(int *fd, int *res) {
-	void * addr;
-	*fd = shm_open(SHM_PATH, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
-	if (fd < 0) {
-		exit(-1);
-	}
-
-	*res = ftruncate(*fd, SHM_F_SIZE);
-	if (res < 0)
-	{
-		exit(-1);
-	}
-
-	addr = mmap(NULL, SHM_F_SIZE, PROT_WRITE, MAP_SHARED, *fd, 0);
-	if (addr == MAP_FAILED){
-		exit(-1);
-	}
-
-	return addr;
-}
-
-void destroy_shm(void *addr) {
-	int ret, fd;
-	ret = munmap(addr, SHM_F_SIZE);
-	if (ret < 0)
-	{
-		exit(-1);
-	}
-
-	fd = shm_unlink(SHM_PATH);
-	if (fd < 0) {
-		exit(-1);
-	}
-}
-
-
-
 volatile sig_atomic_t stop = 0;
 
 //uint64_t BUFFER_SIZE = 8388608UL; //8 MB
@@ -117,14 +76,10 @@ int use_cas = 0;	//default - compare_and_swap disabled
 
 int psync = 0;		// used for process synchronization
 
-char *portno = "12345";
-char *client_portno = "11111";
-char *server_portno = "22222";
-
-int isClient = 0;
+char portno[sizeof(int)*3+2];
 
 struct mr_context regions[MR_COUNT];
-struct time_stats *timer;
+//struct time_stats *timer;
 
 static pthread_t offload_thread;
 
@@ -160,6 +115,8 @@ int n_hash_req = 0;
 
 	struct timespec start;
 #endif
+
+void print_seg_data();
 
 static inline unsigned long ALIGN_FLOOR(unsigned long x, int mask)
 {
@@ -229,47 +186,6 @@ static int adjust_args(int i, char *argv[], int argc, unsigned del)
    return argc;
 }
 
-int process_opt_args(int argc, char *argv[])
-{
-   int dash_d = -1;
-restart:
-   for (int i = 0; i < argc; i++) {
-      //printf("argv[%d] = %s\n", i, argv[i]);
-      if (strncmp("-b", argv[i], 2) == 0) {
-         batch_size = atoi(argv[i+1]);
-         dash_d = i;
-	 argc = adjust_args(dash_d, argv, argc, 2);
-	 goto restart;
-      }
-      else if (strncmp("-e", argv[i], 2) == 0) {
-	 sge_count = atoi(argv[i+1]);
-         dash_d = i;
-	 argc = adjust_args(dash_d, argv, argc, 2);
-	 goto restart;
-      }
-      else if (strncmp("-p", argv[i], 2) == 0) {
-	 portno = argv[i+1];
-         dash_d = i;
-	 argc = adjust_args(dash_d, argv, argc, 2);
-	 goto restart;
-      } 
-      else if (strncmp("-s", argv[i], 2) == 0) {
-	 psync = 1;
-	 dash_d = i;
-	 argc = adjust_args(dash_d, argv, argc, 1);
-	 goto restart;
-      } 
-      else if (strncmp("-cas", argv[i], 4) == 0) {
-	 use_cas = 1;
-	 dash_d = i;
-	 argc = adjust_args(dash_d, argv, argc, 1);
-	 goto restart;
-      } 
-   }
-
-   return argc;
-}
-
 uint32_t str_to_size(char* str)
 {
 	/* magnitude is last character of size */
@@ -301,18 +217,6 @@ uint32_t str_to_size(char* str)
 			break;
 	}
 	return file_size_bytes;
-}
-
-uint32_t signal_encode(uint16_t region_id, uint64_t addr)
-{
-	uint64_t aligned_addr = (ALIGN_FLOOR(addr, BLOCK_SIZE));
-	uint16_t block_nr = (aligned_addr >> BLOCK_SIZE_SHIFT); 
-	//printf("region_id %u block_no %u addr %lu aligned_addr %u offset %u regions[0].type %u\n", region_id,
-	//		(aligned_addr >> BLOCK_SIZE_SHIFT), addr, aligned_addr, addr - aligned_addr, regions[0].type);
-	return ((((uint32_t) block_nr) << 16) |
-			(((uint32_t)region_id) << BLOCK_SIZE_SHIFT) |
-			(((uint32_t)regions[0].type) << (BLOCK_SIZE_SHIFT + 2)) | 
-			(((uint32_t) addr - aligned_addr)));
 }
 
 uint32_t post_dummy_write(int sockfd, int iosize, int imm)
@@ -453,21 +357,21 @@ uint32_t post_hash_read(int sockfd, uint32_t lkey, uint32_t rkey)
 	struct ibv_send_wr *wr = malloc(sizeof(struct ibv_send_wr));
 	memset (wr, 0, sizeof (struct ibv_send_wr));
 
-	struct ibv_sge *sge = malloc(sizeof(struct ibv_sge) * 1);
-	memset(sge, 0, sizeof(struct ibv_sge) * 1);
+	struct ibv_sge *sge = malloc(sizeof(struct ibv_sge) * 2);
+	memset(sge, 0, sizeof(struct ibv_sge) * 2);
 
 	sge[0].addr = local_base_addr;
-	sge[0].length = 4;
+	sge[0].length = 3;
 	sge[0].lkey = lkey;
-	//sge[1].addr = local_base_addr;
-	//sge[1].length = 8;
-	//sge[1].lkey = lkey;
+	sge[1].addr = local_base_addr;
+	sge[1].length = 8;
+	sge[1].lkey = lkey;
 
 	/* prepare the send work request */
 	wr->next = NULL;
 	wr->wr_id = IBV_NEXT_WR_ID(sockfd);
 	wr->sg_list = sge;
-	wr->num_sge = 1;
+	wr->num_sge = 2;
 	wr->wr.rdma.remote_addr = remote_base_addr;
 	wr->wr.rdma.rkey = rkey;
 
@@ -491,20 +395,19 @@ uint32_t post_get_req_async(int sockfd, uint32_t key, addr_t addr, uint32_t imm)
 	//post_dummy_imm(master, 0);
 
 	addr_t base_addr = mr_local_addr(sockfd, MR_BUFFER);
-	uint8_t *param1 = (uint32_t *) base_addr; //key
+	uint8_t *param1 = (uint8_t *) base_addr; //key
 	uint64_t *param2 = (uint64_t *) (base_addr + 4); //addr
 
 	param1[0] = 0;
 	param1[1] = 0;
-	param1[2] = 0;
-	param1[3] = key;
+	param1[2] = key;
 	*param2 = htonll(addr);
 
 	send_meta->sge_entries[0].addr = (uintptr_t) param1;
-	send_meta->sge_entries[0].length = 4;
+	send_meta->sge_entries[0].length = 3;
 	send_meta->sge_entries[1].addr = (uintptr_t) param2;
 	send_meta->sge_entries[1].length = 8;
-	send_meta->length = 12;
+	send_meta->length = 11;
 	send_meta->sge_count = 2;
 	send_meta->addr = 0;
 	send_meta->imm = imm;
@@ -540,25 +443,37 @@ void post_get_req_sync(int sockfd, uint32_t key, addr_t addr, int response_id)
 {
 	struct timespec start, end;
 
+	addr_t base_addr = mr_local_addr(sockfd, MR_DATA);
+	uint64_t *res = (uint64_t *) (base_addr);
+
 	uint32_t wr_id = post_get_req_async(sockfd, key, addr, response_id);
 
 	//clock_gettime(CLOCK_MONOTONIC, &start);
 
-	start = timer_start();
 
 	IBV_TRIGGER(master_sock, sockfd, 0);
 
-	time_stats_start(timer);
+	//time_stats_start(timer);
 
-	printf("trigger lat: %lu usec\n", timer_end(start)/1000);
+	while(*res != 5555) {
+		//printf("res %lu\n", *res);
+		//sleep(1);
+	}
 
+	//time_stats_stop(timer);
+
+	start = timer_start();
 	IBV_AWAIT_RESPONSE(sockfd, response_id);
+	printf("await lat: %lu usec\n", timer_end(start)/1000);
 
 	//IBV_AWAIT_WORK_COMPLETION(sockfd, wr_id);
 
-	time_stats_stop(timer);
 
-	time_stats_print(timer, "Run Complete");
+	//time_stats_print(timer, "Run Complete");
+
+	//reset 
+	*res = 0;
+
 	//IBV_AWAIT_WORK_COMPLETION(sockfd, wr_id);
 
 	//clock_gettime(CLOCK_MONOTONIC, &end);
@@ -608,17 +523,25 @@ void * offload_hash(void *iters)
 	int client = client_sock;
 	int worker = worker_sock;
 
+	while(!(rc_ready(client_sock)) || !(rc_ready(worker_sock))) {
+		asm("");
+	}
+
+	sleep(1);
+
 	//int sr0_wrid, sr1_wrid, sr2_wrid;
 	uint64_t base_data_addr = mr_local_addr(worker, MR_DATA);
 	uint64_t base_buffer_addr = mr_local_addr(worker, MR_BUFFER);
+
+	struct ibv_mr *client_wq_mr = register_wq(client, client);
+	struct ibv_mr *worker_wq_mr = register_wq(worker, worker);
 
 	printf("performing hash offload [client: %d worker: %d]\n", client, worker);
 
 	//post_dummy_write(worker, 0, 9999);
 
-	int count_1 = 11;
-	int count_2 = 4;
-	int count_3 = 11;
+	int count_1 = 8;
+	int count_2 = 1;
 
 	// clear cq
 	//IBV_WAIT_TILL(lock_sockfds[lock_id], lock_sockfds[lock_id], 0);
@@ -626,10 +549,7 @@ void * offload_hash(void *iters)
 
 	for(int k=0; k<count; k++)
 	{
-		if(k == 0)
-			IBV_WAIT_TILL(worker, client, 4);
-		else
-			IBV_WAIT_EXPLICIT(worker, client, 2);
+		IBV_WAIT_EXPLICIT(worker, client, 1);
 			//IBV_WAIT_EXPLICIT(worker, client, -5);
 
 		if(k == count - 1)
@@ -640,7 +560,8 @@ void * offload_hash(void *iters)
 
 		//sr0_wrid = post_hash_read(worker);
 		printf("remote start: %lu end: %lu\n", mr_remote_addr(worker, MR_DATA), mr_remote_addr(worker, MR_DATA) + mr_sizes[MR_DATA]);
-		sr0_wrid = post_hash_read(worker, mr_local_key(client, mr_get_sq_idx(client)), mr_remote_key(worker, MR_DATA));
+		sr0_wrid = post_hash_read(worker, client_wq_mr->lkey, mr_remote_key(worker, MR_DATA));
+		//sr0_wrid = post_hash_read(worker, mr_local_key(client, MR_DATA), mr_remote_key(worker, MR_DATA));
 #if 0
 
 		if(k == 0)
@@ -658,34 +579,25 @@ void * offload_hash(void *iters)
 
 #endif
 
-		sr1_wrid = IBV_CAS_ASYNC(worker, base_buffer_addr, base_buffer_addr, 0, 1, mr_remote_key(master, MR_BUFFER), mr_local_key(client, mr_get_sq_idx(client)), 1);
+		sr1_wrid = IBV_CAS_ASYNC(worker, base_buffer_addr, base_buffer_addr, 0, 1, mr_remote_key(master, MR_BUFFER), client_wq_mr->lkey, 1);
 		//sr1_wrid = IBV_CAS_ASYNC(worker, base_buffer_addr, base_buffer_addr+8, 0, 1, mr_local_key(master, MR_BUFFER), mr_remote_key(master, MR_BUFFER));
 
 		//sr1_wrid = IBV_CONVERT_ENDIAN_ASYNC(worker, base_addr, base_addr, 4, mr_local_key(worker, 0),
 		//		mr_local_rkey(worker, mr_get_sq_idx(worker)));
 
-#if 1
-		if(k == 0)
-			IBV_WAIT_TILL(worker, worker, 3);
-		else
-			IBV_WAIT_EXPLICIT(worker, worker, 2);
-#endif
+		IBV_WAIT_EXPLICIT(worker, worker, 1);
 
 		//if(k == 0)
 		//	IBV_TRIGGER_EXPLICIT(worker, worker, count_2);
 		//else
 
-#if 1
-		if(k == count - 1)
-			IBV_TRIGGER_EXPLICIT(worker, client, count_2);
-		else
-			IBV_TRIGGER_EXPLICIT(worker, client, count_2);
-#endif		
-		sr2_wrid = post_dummy_write(client, 8, k + 1);
+		IBV_TRIGGER_EXPLICIT(worker, client, count_2);
+
+		sr2_wrid = post_dummy_write(client, IO_SIZE, k + 1);
 		//sr2_wrid = post_dummy_write(client, 1048576, k + 1);
 		//sr2_wrid = post_noop(client, 1048576);
 
-		if(k == count - 1)
+		if(k == 0)
 			IBV_TRIGGER(master, worker, 2); // trigger first two wrs
 		//else
 		//	IBV_TRIGGER_EXPLICIT(worker, worker, count_3);
@@ -784,35 +696,40 @@ void * offload_hash(void *iters)
 		for(int i=0; i<8; i++)
 			printf("sr2_wait: rsvd[%d] = %u\n", i, sr2_en_wait->rsvd0[i]);
 #endif
-		
-		sr0_data[0]->addr = htobe64(((uintptr_t) (&sr2_data->lkey)));
+
+		//XXX uncomment temporarily
+		sr0_data[0]->addr = htobe64(((uintptr_t) (&sr2_ctrl->qpn_ds)));
 		sr0_data[1]->addr = htobe64(((uintptr_t) (&sr2_data->addr)));
+
+		//XXX for testing
+		//sr2_ctrl->qpn_ds = sr2_ctrl->qpn_ds | 0xFFFF0000;
+		//sr2_ctrl->qpn_ds = htonl(0xe8000003);
+
+		//XXX might increase latency
+		sr0_ctrl->fm_ce_se = htonl(0);
+
+		sr2_ctrl->fm_ce_se = htonl(0);
 
 		//printf("swap data: %lu\n", be64toh(sr1_atomic->swap_add));
 		//sr1_atomic->swap_add = htobe64(99999999999);
 
 
-		//sr2_ctrl->opmod_idx_opcode = sr2_ctrl->opmod_idx_opcode | 0x09000000; //SEND
-		sr2_data->byte_count = ntohl(8);
+		sr2_ctrl->opmod_idx_opcode = sr2_ctrl->opmod_idx_opcode | 0x09000000; //SEND
 
-		sr1_atomic->swap_add =  htobe64(*((uint64_t *)sr2_data));
+		sr1_atomic->swap_add =  htobe64(*((uint64_t *)&sr2_ctrl->opmod_idx_opcode));
+
+		sr2_ctrl->qpn_ds = htonl((0 << 8) | 3);
 
 		sr2_ctrl->opmod_idx_opcode = sr2_ctrl->opmod_idx_opcode & 0x00FFFFFF; //NOOP
-		//sr2_data->byte_count = ntohl(0);
 
 		sr2_ctrl->imm = htonl(k+1);
 
-		sr1_raddr->raddr = htobe64((uintptr_t) sr2_data);
-		sr1_atomic->compare = htobe64(*((uint64_t *)sr2_data));
+		sr1_raddr->raddr = htobe64((uintptr_t) &sr2_ctrl->opmod_idx_opcode);
+		sr1_atomic->compare = htobe64(*((uint64_t *)&sr2_ctrl->opmod_idx_opcode));
 		//sr1_atomic->compare = (*((uint64_t *)&sr2_ctrl->opmod_idx_opcode)) & 0x00FFFFFFFFFFFFFF;
 
-		
-		//XXX for testing
-		//sr2_data->addr = htobe64(0);
-		//sr2_data->lkey = htonl(0);
 
-
-#if 1
+#if 0
 		printf("------ BEFORE ------\n");
 		printf("sr0_data[0]: addr %lu length %u\n", be64toh(sr0_data[0]->addr), ntohl(sr0_data[0]->byte_count));
 		printf("sr0_data[1]: addr %lu length %u\n", be64toh(sr0_data[1]->addr), ntohl(sr0_data[1]->byte_count));
@@ -826,10 +743,10 @@ void * offload_hash(void *iters)
 		opmod2 = ((sr2_meta >> 24) & (UINT_MAX));
 		opcode2 = (sr2_meta & USHRT_MAX);
 
-		printf("address of sr2_data %lu\n", (uintptr_t)sr2_data);
-		printf("sr2_ctrl: raw %lx idx %u opmod %u opcode %u qpn_ds %x (imm %u)\n", *((uint64_t *)&sr2_ctrl->opmod_idx_opcode), idx2, opmod2, opcode2, ntohl(sr2_ctrl->qpn_ds), ntohl(sr2_ctrl->imm));
-		printf("sr2_data: raw %lx addr %lu length %u lkey %u\n", *((uint64_t *)sr2_data), be64toh(sr2_data->addr), ntohl(sr2_data->byte_count), ntohl(sr2_data->lkey));
-		printf("sr2_raddr: raddr %lu rkey %u\n", be64toh(sr2_raddr->raddr), ntohl(sr2_raddr->rkey));
+		printf("&sr2_ctrl->opmod_idx_opcode %lu\n", (uintptr_t)&sr2_ctrl->opmod_idx_opcode);
+		printf("sr2_ctrl: raw %lx idx %u opmod %u opcode %u qpn_ds %x fm_ce_se %x (imm %u)\n", *((uint64_t *)&sr2_ctrl->opmod_idx_opcode), idx2, opmod2, opcode2, ntohl(sr2_ctrl->qpn_ds), ntohl(sr2_ctrl->fm_ce_se), ntohl(sr2_ctrl->imm));
+		printf("sr2_data: addr %lu length %u\n", be64toh(sr2_data->addr), ntohl(sr2_data->byte_count));
+		printf("*sr2_data->addr = %lu\n", *((uint64_t *)be64toh(sr2_data->addr)));
 #if 0
 		*((uint64_t *)base_buffer_addr) = 8888;
 		*((uint64_t *)(base_buffer_addr + 8)) = 9999;
@@ -845,14 +762,14 @@ void * offload_hash(void *iters)
 		struct rdma_metadata *recv_meta =  (struct rdma_metadata *)
 			calloc(1, sizeof(struct rdma_metadata) + 2 * sizeof(struct ibv_sge));
 
-		recv_meta->sge_entries[0].addr = ((uintptr_t)&sr1_atomic->compare);
-		recv_meta->sge_entries[0].length = 4;
+		recv_meta->sge_entries[0].addr = ((uintptr_t)&sr1_atomic->compare)+1;
+		recv_meta->sge_entries[0].length = 3;
 		recv_meta->sge_entries[1].addr = (uintptr_t)&sr0_raddr->raddr;
 		recv_meta->sge_entries[1].length = 8;
-		recv_meta->length = 12;
+		recv_meta->length = 11;
 		recv_meta->sge_count = 2;
 
-		IBV_RECEIVE_SG(client, recv_meta, mr_local_key(worker, mr_get_sq_idx(worker)));
+		IBV_RECEIVE_SG(client, recv_meta, worker_wq_mr->lkey);
 
 #else
 		// set up RECV for client inputs
@@ -882,69 +799,67 @@ void * offload_hash(void *iters)
 		while(k - n_hash_req > 50)
 			ibw_cpu_relax();
 	}
+
+	return NULL;
 }
 
 void test_callback(struct app_context *msg)
 {
 #if 1
 	//ibw_cpu_relax();
-	if(!isClient) {	
 
-		//printf("posting receive imm\n");
-		int sock_type = rc_connection_meta(msg->sockfd);
+	//printf("posting receive imm\n");
+	int sock_type = rc_connection_meta(msg->sockfd);
 
-		//XXX do not post receives on master lock socket
-		if(sock_type != SOCK_CLIENT)
-			IBV_RECEIVE_IMM(msg->sockfd);
+	//XXX do not post receives on master lock socket
+	if(sock_type != SOCK_CLIENT)
+		IBV_RECEIVE_IMM(msg->sockfd);
 
-		if(sock_type == SOCK_CLIENT)
-			n_hash_req++;
+	if(sock_type == SOCK_CLIENT)
+		n_hash_req++;
 
 #if 0
-		for(int i=0; i<10; i++) {
-			if(sock_type == SOCK_CLIENT)
-				printf("after lock_ctx[%d].count = %lu\n", i, lock_ctx[i].count);
-			else if(sock_type == SOCK_UNLOCK)
-				printf("after lock_ctx[%d].service = %lu\n", i, lock_ctx[i].service);
-		}
+	for(int i=0; i<10; i++) {
+		if(sock_type == SOCK_CLIENT)
+			printf("after lock_ctx[%d].count = %lu\n", i, lock_ctx[i].count);
+		else if(sock_type == SOCK_UNLOCK)
+			printf("after lock_ctx[%d].service = %lu\n", i, lock_ctx[i].service);
+	}
 #endif
 #if 1
 
-		print_seg_data();
+	//print_seg_data();
 
 #endif
-	}
 	printf("Received response with id %d\n", msg->id);
 #endif
 }
 
 void print_seg_data()
 {
-	if(sr0_data && sr0_raddr) {
-		printf("------ AFTER ------\n");
-		printf("sr0_data[0]: addr %lu length %u\n", be64toh(sr0_data[0]->addr), ntohl(sr0_data[0]->byte_count));
-		printf("sr0_data[1]: addr %lu length %u\n", be64toh(sr0_data[1]->addr), ntohl(sr0_data[1]->byte_count));
-		printf("sr0_raddr: raddr %lu\n", ntohll(sr0_raddr->raddr));
-		printf("sr1_atomic: compare %lx (original: %lx) swap_add %lx (original: %lx)\n",
-				be64toh(sr1_atomic->compare), sr1_atomic->compare, be64toh(sr1_atomic->swap_add), sr1_atomic->swap_add);
-		printf("sr1_raddr: raddr %lu\n", ntohll(sr1_raddr->raddr));
+	printf("------ AFTER ------\n");
+	printf("sr0_data[0]: addr %lu length %u\n", be64toh(sr0_data[0]->addr), ntohl(sr0_data[0]->byte_count));
+	printf("sr0_data[1]: addr %lu length %u\n", be64toh(sr0_data[1]->addr), ntohl(sr0_data[1]->byte_count));
+	printf("sr0_raddr: raddr %lu\n", ntohll(sr0_raddr->raddr));
+	printf("sr1_atomic: compare %lx (original: %lx) swap_add %lx (original: %lx)\n",
+	be64toh(sr1_atomic->compare), sr1_atomic->compare, be64toh(sr1_atomic->swap_add), sr1_atomic->swap_add);
+	printf("sr1_raddr: raddr %lu\n", ntohll(sr1_raddr->raddr));
 
-		uint32_t sr2_meta = ntohl(sr2_ctrl->opmod_idx_opcode);
-		uint16_t idx2 =  ((sr2_meta >> 8) & (UINT_MAX));
-		uint8_t opmod2 = ((sr2_meta >> 24) & (UINT_MAX));
-		uint8_t opcode2 = (sr2_meta & USHRT_MAX);
+	uint32_t sr2_meta = ntohl(sr2_ctrl->opmod_idx_opcode);
+	uint16_t idx2 =  ((sr2_meta >> 8) & (UINT_MAX));
+	uint8_t opmod2 = ((sr2_meta >> 24) & (UINT_MAX));
+	uint8_t opcode2 = (sr2_meta & USHRT_MAX);
 
-		printf("address of sr2_data %lu\n", (uintptr_t)sr2_data);
-		printf("sr2_ctrl: raw %lx idx %u opmod %u opcode %u qpn_ds %x (imm %u)\n", *((uint64_t *)&sr2_ctrl->opmod_idx_opcode), idx2, opmod2, opcode2, ntohl(sr2_ctrl->qpn_ds), ntohl(sr2_ctrl->imm));
-		printf("sr2_data: raw %lx addr %lu length %u lkey %u\n", *((uint64_t *)sr2_data), be64toh(sr2_data->addr), ntohl(sr2_data->byte_count), ntohl(sr2_data->lkey));
-		printf("sr2_raddr: raddr %lu rkey %u\n", be64toh(sr2_raddr->raddr), ntohl(sr2_raddr->rkey));
+	printf("&sr2_ctrl->opmod_idx_opcode %lu\n", (uintptr_t)&sr2_ctrl->opmod_idx_opcode);
+	printf("sr2_ctrl: raw %lx idx %u opmod %u opcode %u qpn_ds %x fm_ce_se %x (imm %u)\n", *((uint64_t *)&sr2_ctrl->opmod_idx_opcode), idx2, opmod2, opcode2, ntohl(sr2_ctrl->qpn_ds), ntohl(sr2_ctrl->fm_ce_se), ntohl(sr2_ctrl->imm));
+	printf("sr2_data: addr %lu length %u\n", be64toh(sr2_data->addr), ntohl(sr2_data->byte_count));
+	printf("*sr2_data->addr = %lu\n", *((uint64_t *)be64toh(sr2_data->addr)));
 
 #if 0
-		addr_t base_buffer_addr = mr_local_addr(msg->sockfd, MR_BUFFER);
-		printf("buffer1: %lu\n", *((uint64_t *)base_buffer_addr));
-		printf("buffer2: %lu\n", *((uint64_t *)(base_buffer_addr + 8)));
+	addr_t base_buffer_addr = mr_local_addr(msg->sockfd, MR_BUFFER);
+	printf("buffer1: %lu\n", *((uint64_t *)base_buffer_addr));
+	printf("buffer2: %lu\n", *((uint64_t *)(base_buffer_addr + 8)));
 #endif
-	}
 }
 
 void add_peer_socket(int sockfd)
@@ -953,7 +868,7 @@ void add_peer_socket(int sockfd)
 
 	printf("ADDING PEER SOCKET %d (type: %d)\n", sockfd, sock_type);
 
-	if(isClient || sock_type != SOCK_CLIENT) { //XXX do not post receives on master socket
+	if(sock_type != SOCK_CLIENT) { //XXX do not post receives on master socket
 		for(int i=0; i<100; i++) {
 			IBV_RECEIVE_IMM(sockfd);
 		}
@@ -977,6 +892,7 @@ void remove_peer_socket(int sockfd)
 
 void init_hash_map(addr_t addr)
 {
+#if 0
 	printf("---- Initializing hashmap ----\n");
 
 	struct hash_bucket *bucket = (struct hash_bucket*)addr;
@@ -986,18 +902,18 @@ void init_hash_map(addr_t addr)
 		bucket[i].key[0] = i+1000;
 		bucket[i].key[1] = 0;
 		bucket[i].key[2] = 0;
-		bucket[i].addr = htobe64((uintptr_t) &bucket[i].value);
-		bucket[i].value[0] = 5000 * i;
+		bucket[i].addr = htobe64((uintptr_t) &bucket[i].value[0]);
+		bucket[i].value[0] = 5555 + i;
 
 		printf("bucket[%d] key=%u addr=%lu\n", i, *((uint32_t *)bucket[i].key), be64toh(bucket[i].addr)); 
 	}
+#endif
 }
 
-int main(int argc, char **argv)
+int run_offload_server(addr_t hash_addr, addr_t hash_size, char *port)
 {
 	char *host;
 	//char *portno = "12345";
-	void *ptr;
 	uint32_t iosize;
 	uint32_t transfer_size;
 	int n_chain;
@@ -1009,56 +925,31 @@ int main(int argc, char **argv)
 	int offload_count = OFFLOAD_COUNT;
 
 	int dev = 0;
+	void *ptr = NULL;
 
+	//timer = (struct time_stats*) malloc(sizeof(struct time_stats));
+	//int *shm_proc = (int*)create_shm(&shm_fd, &shm_ret);
 
-	timer = (struct time_stats*) malloc(sizeof(struct time_stats));
-	int *shm_proc = (int*)create_shm(&shm_fd, &shm_ret);
+	strncpy(portno, port, sizeof(int)*3+2);
 
-	argc = process_opt_args(argc, argv);
+	// allocate dram region
+	regions[MR_DATA].type = MR_DATA;
+	regions[MR_DATA].addr = hash_addr;
+	regions[MR_DATA].length = hash_size;
 
-	if(psync) {
-		printf("Setting shm_proc to zero\n");
-		*shm_proc = 0;
-		return 0;
-	}
+	// allocate dram region
+	printf("Mapping dram memory: size %lu pagesize %lu\n", BUFFER_SIZE, sysconf(_SC_PAGESIZE));
+	ret = posix_memalign(&ptr, sysconf(_SC_PAGESIZE), BUFFER_SIZE);
 
-	if (argc != 3 && argc != 1) {
-		fprintf(stderr, "usage: %s <peer-address> <iters> [-p <portno>] [-e <sge count>] [-b <batch size>]  (note: run without args to use as server)\n", argv[0]);
+	if(ret) {
+		printf("Failed to map space for dram memory region\n");
 		return 1;
 	}
 
-	if(argc > 1)
-		isClient = 1;
+	regions[MR_BUFFER].type = MR_BUFFER;
+	regions[MR_BUFFER].addr = (uintptr_t) ptr;
+	regions[MR_BUFFER].length = BUFFER_SIZE;
 
-	if(isClient) {
-	
-		iters = atoi(argv[2]);
-#ifdef LAT
-		time_stats_init(timer, iters);
-#else
-		time_stats_init(timer, 1);
-#endif
-		portno = client_portno;
-		//if(transfer_size > MR_SIZE) {
-		//	printf("Insufficient memory region size; required %u while MR_SIZE is set to %lu\n", transfer_size, MR_SIZE);
-		//	return 1;
-		//}
-	}
-	else
-		portno = server_portno;
-
-	// allocate dram region
-	for(int i=0; i<MR_COUNT; i++) {
-		printf("Mapping dram memory: size %lu bytes\n", mr_sizes[i]);
-		ret = posix_memalign(&ptr, sysconf(_SC_PAGESIZE), mr_sizes[i]);
-		regions[i].type = i;
-		regions[i].addr = (uintptr_t) ptr;
-		regions[i].length = mr_sizes[i];
-		if(ret) {
-			printf("Failed to map space for dram memory region\n");
-			return 1;
-		}
-	}
 
 	/*
 	//allocate some additional buffers
@@ -1080,177 +971,57 @@ int main(int argc, char **argv)
 			add_peer_socket, remove_peer_socket, test_callback);
 
 	// Run in server mode
-	if(!isClient) {
 
-		master_sock = add_connection("13.13.13.7", portno, SOCK_MASTER, 1, 0);
-		//signal(SIGINT, inthand);
+	master_sock = add_connection("13.13.13.7", portno, SOCK_MASTER, 1, 0);
+	//signal(SIGINT, inthand);
 
-		init_hash_map(regions[MR_DATA].addr);
-
-		while(!(rc_ready(client_sock)) && !(rc_ready(worker_sock)) && !stop) {
-        		asm("");
-		}
-
-		sleep(5);
-
-		pthread_create(&offload_thread, NULL, offload_hash, &offload_count);
-
-		sleep(5);
-
-		//IBV_AWAIT_WORK_COMPLETION(worker_sock, sr1_wrid);
-		//printf("read end: %lu\n", timer_end(start));
-
-		//IBV_AWAIT_WORK_COMPLETION(client_sock, sr2_wrid);
-		//printf("write end: %lu\n", timer_end(start));
-
-		if(1) {
-			int count = 0;
-			while(!stop) {
-#if 1
-				getchar();
-				printf("test\n");
-				IBV_TRIGGER(master_sock, client_sock, 0);
-				print_seg_data();
-#else
-
-				IBV_AWAIT_RESPONSE(client_sock, count+1);
-				start = timer_start();
-
-				IBV_AWAIT_WORK_COMPLETION(worker_sock, temp1_wrid[count]);
-				printf("read end: %lu\n", timer_end(start) / 1000);
-
-				IBV_AWAIT_WORK_COMPLETION(client_sock, temp2_wrid[count]);
-				printf("write end: %lu\n", timer_end(start) / 1000);
-
-				count++;
-#endif
-			}
-		}
-		else {
- 			while(!stop) {
-				sleep(3);
-			}
-		}
-
-		free((void *)regions[0].addr);
-		return 0;
-	}
-
-	master_sock = add_connection("13.13.13.6", portno, SOCK_MASTER, 1, 0);
-
-	while(!(rc_ready(master_sock)) && !stop) {
-        		asm("");
-	}
-
-	// Run in client mode
- 	client_sock = add_connection(argv[1], server_portno, SOCK_CLIENT, 1, IBV_EXP_QP_CREATE_MANAGED_SEND);
-
-	sleep(5);
-
-	int n_remaining = iters;
-
-#ifndef LAT
-	printf("Waiting for start signal\n");
-	*shm_proc += 1;
-	while (*shm_proc > 0){
-		usleep(100);
-	}
-	time_stats_start(timer);
-#endif
-
-	printf("Starting benchmark ...\n");
+	//init_hash_map(regions[MR_DATA].addr);
 
 
-	if(1) {
-		int response_id = 1;
-		while(!stop) {
-			char c = getchar();
-			getchar(); // for newline
-			//char n = getchar();
-			//getchar(); // for newline
-
-			//post_recv_response(client_sock);
-			IBV_RECEIVE_IMM(client_sock);
-
-			post_get_req_sync(client_sock, 1002, mr_remote_addr(client_sock, MR_DATA), response_id);
-
-			response_id++;
-
-
-
-			//if(c == 'l')
-			//	post_lock_req(client_sock, lock_id, 0);
-			//else if(c == 'u')
-			//	post_lock_req(unclient_sock, lock_id, 1);
-			//else {
-			//	printf("unrecognized input command\n");
-			//	exit(-1);
-			//}
-		}
-
-	}
-#if 1
-	for(int i=0; i<iters; i++)
-	{
-		//post_recv_response(client_sock);
-		IBV_RECEIVE_IMM(client_sock);
-	}
-#endif
-	for(int i=0; i<iters; i++)
-	{
-		//int op_counter = 0;
-
-		//printf("--> Send trigger\n");
-#ifdef LAT
-		time_stats_start(timer);
-#endif
-
-		//post_lock_req(client_sock, i, 0);
-		//post_lock_req(unclient_sock, i, 1);
-
-#ifdef LAT
-		IBV_AWAIT_RESPONSE(client_sock, 1000+i);
-		//IBV_AWAIT_WORK_COMPLETION(worker_sock, wrid2);
-		time_stats_stop(timer);
-		sleep(0.2);
-#endif
-		//op_counter++;
-	}
-
-	// wait for all posted tasks to complete
-	//IBV_AWAIT_RESPONSE(client_sock, 1000 + iters - 1);
-	//IBV_AWAIT_WORK_COMPLETION(worker_sock, wrid2);
-
-#ifndef LAT
-	time_stats_stop(timer);
-#endif
-
-	time_stats_print(timer, "Run Complete");
-
-#if 0
-	sleep(2);
-
-	time_stats_start(timer);
-
-	IBV_TRIGGER_EXPLICIT(master, worker, 10);
-
-	IBV_AWAIT_WORK_COMPLETION(worker, wr_id);
-		
-	time_stats_stop(timer);
-
-	time_stats_print(timer, "Run Complete");
-#endif
-
-#ifndef LAT
-	printf("Throughput: %3.3f ops/s\n",(float)(iters)
-			/ ((float) time_stats_get_avg(timer)));
-#endif
-
-	//printf("Throughput: %3.3f MB/s\n",(float)(transfer_size)
-	//		/ (1024.0 * 1024.0 * (float) time_stats_get_avg(timer)));
 
 	sleep(1);
-	//free(ptr);
+
+	pthread_create(&offload_thread, NULL, offload_hash, &offload_count);
+
+	//sleep(5);
+
+	//IBV_AWAIT_WORK_COMPLETION(worker_sock, sr1_wrid);
+	//printf("read end: %lu\n", timer_end(start));
+
+	//IBV_AWAIT_WORK_COMPLETION(client_sock, sr2_wrid);
+	//printf("write end: %lu\n", timer_end(start));
+# if 0
+	if(1) {
+		int count = 0;
+		while(!stop) {
+			//getchar();
+			printf("test\n");
+			//IBV_TRIGGER(master_sock, client_sock, 0);
+			//IBV_TRIGGER(unlock, lock_sockfds[lock_id], 1); // trigger dummy unlock
+			//print_seg_data();
+
+			IBV_AWAIT_RESPONSE(client_sock, count+1);
+			start = timer_start();
+
+			IBV_AWAIT_WORK_COMPLETION(worker_sock, temp1_wrid[count]);
+			printf("read end: %lu\n", timer_end(start) / 1000);
+
+			IBV_AWAIT_WORK_COMPLETION(client_sock, temp2_wrid[count]);
+			printf("write end: %lu\n", timer_end(start) / 1000);
+
+			count++;
+		}
+	}
+	else {
+		while(!stop) {
+			sleep(3);
+		}
+	}
+#endif
+
+	//free((void *)regions[0].addr);
+
+	printf("exiting offload function\n");
 
 	return 0;
 }
