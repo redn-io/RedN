@@ -570,7 +570,7 @@ void rdma_event_loop(struct rdma_event_channel *ec, int exit_on_connect, int exi
 
 		}
 		else if (event_copy.event == RDMA_CM_EVENT_ESTABLISHED) {
-			finalize_connection(event_copy.id, &event->param.conn);
+			finalize_connection(event_copy.id, &event_copy.param.conn);
 			
 			if (s_on_connect_cb) {
 				debug_print("trigger post-connection callback\n");
