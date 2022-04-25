@@ -13,7 +13,7 @@
 
 #define BUCKET_COUNT 2
 
-#define OFFLOAD_COUNT 1
+#define OFFLOAD_COUNT 50000
 
 #define IO_SIZE 65536
 //#define IO_SIZE 1024
@@ -628,7 +628,7 @@ void post_get_req_sync(int *socks, uint32_t key, addr_t addr, int response_id)
 	struct timespec start, end;
 
 	addr_t base_addr = mr_local_addr(socks[0], MR_DATA);
-	uint64_t *res = (uint64_t *) (base_addr);
+	volatile uint64_t *res = (volatile uint64_t *) (base_addr);
 
 
 #if REDN_PARALLEL
@@ -1287,6 +1287,11 @@ int main(int argc, char **argv)
 	if(isClient) {
 	
 		iters = atoi(argv[2]);
+
+		if(iters > OFFLOAD_COUNT) {
+			fprintf(stderr, "iters should be less than or equal to OFFLOAD_COUNT = %d\n", OFFLOAD_COUNT);
+			return 1;
+		}
 #ifdef LAT
 		time_stats_init(timer, iters);
 #else
@@ -1525,7 +1530,7 @@ int main(int argc, char **argv)
 	//printf("Throughput: %3.3f MB/s\n",(float)(transfer_size)
 	//		/ (1024.0 * 1024.0 * (float) time_stats_get_avg(timer)));
 
-	pause();
+	//pause();
 	//free(ptr);
 
 	return 0;

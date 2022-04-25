@@ -16,7 +16,7 @@
 
 #define LIST_SIZE 8
 
-#define OFFLOAD_COUNT 1000
+#define OFFLOAD_COUNT 5000
 
 #define REDN 1
 //#define ONE_SIDED 1
@@ -659,7 +659,7 @@ void post_get_req_sync(int sockfd, uint32_t key, int response_id)
 	addr_t base_addr = mr_local_addr(sockfd, MR_DATA);
 
 #if REDN
-	uint64_t *res = (uint64_t *) (base_addr);
+	volatile uint64_t *res = (volatile uint64_t *) (base_addr);
 
 	uint32_t wr_id = post_get_req_async(sockfd, key, response_id);
 
@@ -1324,6 +1324,11 @@ int main(int argc, char **argv)
 	if(isClient) {
 	
 		iters = atoi(argv[2]);
+
+		if(iters > OFFLOAD_COUNT) {
+			fprintf(stderr, "iters should be less than or equal to OFFLOAD_COUNT = %d\n", OFFLOAD_COUNT);
+			return 1;
+		}
 #ifdef LAT
 		time_stats_init(timer, iters);
 #else
